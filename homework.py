@@ -9,7 +9,7 @@ import telebot
 from dotenv import load_dotenv
 
 import messages
-from exceptions import APIRequestError, APIStatusCodeError
+from exceptions import APIStatusCodeError, TokensError
 
 load_dotenv()
 
@@ -21,6 +21,8 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 RETRY_PERIOD = 600
 ENDPOINT = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
 HEADERS = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
+
+LOG_FORMAT = '%(asctime)s [%(levelname)s] %(funcName)s:%(lineno)d %(message)s'
 
 
 HOMEWORK_VERDICTS = {
@@ -34,11 +36,13 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(
-    logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-)
-logger.addHandler(handler)
+formatter = logging.Formatter(LOG_FORMAT)
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(formatter)
+file_handler = logging.FileHandler(__file__ + '.log', encoding='utf-8')
+file_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
 
 
 def check_tokens():
@@ -50,9 +54,9 @@ def check_tokens():
     }
     missing = [name for name, value in tokens.items() if not value]
     if missing:
-        logger.critical(messages.MISSING_TOKENS.format(tokens=missing))
-        return False
-    return True
+        message = messages.MISSING_TOKENS.format(tokens=missing)
+        logger.critical(message)
+        raise TokensError(message)
 
 
 def send_message(bot, message):
@@ -62,28 +66,31 @@ def send_message(bot, message):
     except (telebot.apihelper.ApiException,
             requests.RequestException) as error:
         logger.error(messages.SEND_MESSAGE_ERROR.format(error=error))
-    else:
-        logger.debug(messages.MESSAGE_SENT.format(message=message))
+        return False
+    logger.debug(messages.MESSAGE_SENT.format(message=message))
+    return True
 
 
 def get_api_answer(timestamp):
     """Дёргаем апи и отдаём ответ словарём."""
+    request_params = {
+        'url': ENDPOINT,
+        'headers': HEADERS,
+        'params': {'from_date': timestamp},
+    }
+    logger.debug(messages.API_REQUEST_START.format(**request_params))
     try:
-        response = requests.get(
-            ENDPOINT,
-            headers=HEADERS,
-            params={'from_date': timestamp},
-        )
+        response = requests.get(**request_params)
     except requests.RequestException as error:
-        raise APIRequestError(
-            messages.API_REQUEST_ERROR.format(
-                endpoint=ENDPOINT, error=error
-            )
+        raise ConnectionError(
+            messages.API_REQUEST_ERROR.format(**request_params, error=error)
         )
     if response.status_code != HTTPStatus.OK:
         raise APIStatusCodeError(
             messages.API_STATUS_ERROR.format(
-                endpoint=ENDPOINT, code=response.status_code
+                code=response.status_code,
+                reason=response.reason,
+                text=response.text,
             )
         )
     return response.json()
@@ -108,7 +115,7 @@ def parse_status(homework):
     homework_name = homework['homework_name']
     status = homework.get('status')
     if status not in HOMEWORK_VERDICTS:
-        raise ValueError(messages.UNKNOWN_STATUS.format(status=status))
+        raise ValueError(messages.UNEXPECTED_STATUS.format(status=status))
     verdict = HOMEWORK_VERDICTS[status]
     return messages.STATUS_CHANGED.format(
         name=homework_name, verdict=verdict
@@ -117,8 +124,7 @@ def parse_status(homework):
 
 def main():
     """Тут вся логика бота крутится."""
-    if not check_tokens():
-        sys.exit(messages.NO_TOKENS_EXIT)
+    check_tokens()
 
     bot = telebot.TeleBot(token=TELEGRAM_TOKEN)
     timestamp = int(time.time())
@@ -128,20 +134,17 @@ def main():
         try:
             response = get_api_answer(timestamp)
             homeworks = check_response(response)
-            if homeworks:
-                message = parse_status(homeworks[0])
-            else:
-                message = ''
+            if not homeworks:
                 logger.debug(messages.NO_NEW_STATUSES)
-            if message and message != last_message:
-                send_message(bot, message)
+                continue
+            message = parse_status(homeworks[0])
+            if message != last_message and send_message(bot, message):
                 last_message = message
             timestamp = response.get('current_date', timestamp)
         except Exception as error:
             message = messages.PROGRAM_FAILURE.format(error=error)
             logger.error(message)
-            if message != last_message:
-                send_message(bot, message)
+            if message != last_message and send_message(bot, message):
                 last_message = message
         finally:
             time.sleep(RETRY_PERIOD)
