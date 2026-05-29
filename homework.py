@@ -140,7 +140,7 @@ def main():
             message = parse_status(homeworks[0])
             if message != last_message and send_message(bot, message):
                 last_message = message
-            timestamp = response.get('current_date', timestamp)
+                timestamp = response.get('current_date', timestamp)
         except Exception as error:
             message = messages.PROGRAM_FAILURE.format(error=error)
             logger.error(message)
